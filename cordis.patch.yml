@@ -1,0 +1,7 @@
+# Session trash: browser rows in the Session "..." menu plus the host route
+# that owns the delete. The host row waits for `connection` and stays inactive
+# in compositions that never mount it; the client rows simply never find their
+# slots there.
+- insert:
+    - id: session-trash
+      name: 'dsh-session-trash'

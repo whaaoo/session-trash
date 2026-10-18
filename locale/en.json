@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Trash",
+    "description": "Adds Move to Trash and Delete Permanently to every Session row menu. The trash copy is kept under the harness home and can be restored at any time."
+  }
+}
