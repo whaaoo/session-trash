@@ -3,7 +3,11 @@
  * browser rows call.
  *
  * The route is the single place the operation lives, so a future agent tool or
- * command can call `performDelete` directly instead of re-implementing it.
+ * command can call the store functions directly instead of re-implementing
+ * them. The body dispatches on `action`:
+ *
+ *   delete (default, legacy `{sessionId, mode}`) · list · restore · purge ·
+ *   empty · expire
  *
  * Why an exact Fetch route rather than a generic RPC channel: the generic
  * `connection.rpc` registry registers its HTTP route through the *reading*
@@ -12,12 +16,24 @@
  * `connection` itself.
  */
 
-import { performDelete, SessionDeleteRefusal } from './store.js'
+import {
+  emptyTrash,
+  listTrash,
+  performDelete,
+  purgeExpiredTrash,
+  purgeTrashEntry,
+  restoreTrashEntry,
+  SessionDeleteRefusal,
+} from './store.js'
 
 /** Exact route under the shared `/api` carrier; reachable by the owner Peer only. */
 const ROUTE_PATH = '/api/dsh-session-trash'
 
-/** Sessions whose deletion is already in flight, so a double click cannot race. */
+/**
+ * Operation keys already in flight, so a double click cannot race. Keys are
+ * namespaced per operation (`delete:<id>`, `restore:<id>`, …) instead of one
+ * global flag, so deleting session A never blocks restoring session B.
+ */
 const inFlight = new Set()
 
 export const name = 'session-trash'
@@ -45,7 +61,19 @@ function failure(code, message, details = {}) {
 }
 
 /**
- * Answer one deletion request.
+ * Try to claim an in-flight key.
+ * @param {string} key operation key.
+ * @param {string} label human label for the busy message.
+ * @returns {{ ok: false, error: object } | null} busy envelope, or null when claimed.
+ */
+function claim(key, label) {
+  if (inFlight.has(key)) return failure('busy', `${label} is already in progress`)
+  inFlight.add(key)
+  return null
+}
+
+/**
+ * Answer one trash request, dispatching on `action`.
  * @param {import('@deepseek-ai/cordis').Context} ctx plugin context.
  * @param {Request} request buffered request.
  * @returns {Promise<Response>} JSON envelope.
@@ -58,11 +86,45 @@ async function handleRequest(ctx, request) {
     return json(failure('invalid', 'request body is not JSON'))
   }
   const args = body !== null && typeof body === 'object' ? body : {}
+  const action = typeof args.action === 'string' && args.action !== '' ? args.action : 'delete'
+
+  try {
+    switch (action) {
+      case 'delete':
+        return await handleDelete(ctx, args)
+      case 'list':
+        return json({ ok: true, value: await listTrash() })
+      case 'restore':
+        return await handleRestore(ctx, args)
+      case 'purge':
+        return await handlePurge(args)
+      case 'empty':
+        return await handleEmpty()
+      case 'expire':
+        return await handleExpire(args)
+      default:
+        return json(failure('invalid', `unknown action: ${JSON.stringify(action)}`))
+    }
+  } catch (error) {
+    if (error instanceof SessionDeleteRefusal) return json(failure(error.code, error.message, error.details))
+    return json(failure('failed', error instanceof Error ? error.message : String(error)))
+  }
+}
+
+/**
+ * Delete one stored Session. `mode` defaults to `trash` when omitted for
+ * backward compatibility, but an explicit unknown mode is rejected instead of
+ * silently becoming a trash move.
+ */
+async function handleDelete(ctx, args) {
   const sessionId = typeof args.sessionId === 'string' ? args.sessionId : ''
   if (sessionId === '') return json(failure('invalid', 'sessionId is required'))
-  if (inFlight.has(sessionId)) return json(failure('busy', `session ${sessionId} is already being deleted`))
-
-  inFlight.add(sessionId)
+  if (args.mode !== undefined && args.mode !== 'trash' && args.mode !== 'permanent') {
+    return json(failure('invalid', `unknown mode: ${JSON.stringify(args.mode)}`))
+  }
+  const key = `delete:${sessionId}`
+  const busy = claim(key, `session ${sessionId}`)
+  if (busy) return json(busy)
   try {
     const value = await performDelete(ctx, {
       sessionId,
@@ -74,8 +136,73 @@ async function handleRequest(ctx, request) {
     if (error instanceof SessionDeleteRefusal) return json(failure(error.code, error.message, error.details))
     return json(failure('failed', error instanceof Error ? error.message : String(error)))
   } finally {
-    inFlight.delete(sessionId)
+    inFlight.delete(key)
   }
+}
+
+/** Restore one trash entry by `trashId` or `sessionId`. */
+async function handleRestore(ctx, args) {
+  const trashId = typeof args.trashId === 'string' ? args.trashId : ''
+  const sessionId = typeof args.sessionId === 'string' ? args.sessionId : ''
+  if (trashId === '' && sessionId === '') return json(failure('invalid', 'trashId or sessionId is required'))
+  const key = `restore:${trashId !== '' ? trashId : sessionId}`
+  const busy = claim(key, 'this restore')
+  if (busy) return json(busy)
+  try {
+    const value = await restoreTrashEntry(ctx, {
+      trashId: trashId !== '' ? trashId : undefined,
+      sessionId: sessionId !== '' ? sessionId : undefined,
+    })
+    return json({ ok: true, value })
+  } catch (error) {
+    if (error instanceof SessionDeleteRefusal) return json(failure(error.code, error.message, error.details))
+    return json(failure('failed', error instanceof Error ? error.message : String(error)))
+  } finally {
+    inFlight.delete(key)
+  }
+}
+
+/** Permanently purge one trash entry by `trashId` or `sessionId`. */
+async function handlePurge(args) {
+  const trashId = typeof args.trashId === 'string' ? args.trashId : ''
+  const sessionId = typeof args.sessionId === 'string' ? args.sessionId : ''
+  if (trashId === '' && sessionId === '') return json(failure('invalid', 'trashId or sessionId is required'))
+  const key = `purge:${trashId !== '' ? trashId : sessionId}`
+  const busy = claim(key, 'this purge')
+  if (busy) return json(busy)
+  try {
+    const value = await purgeTrashEntry({
+      trashId: trashId !== '' ? trashId : undefined,
+      sessionId: sessionId !== '' ? sessionId : undefined,
+    })
+    return json({ ok: true, value })
+  } catch (error) {
+    if (error instanceof SessionDeleteRefusal) return json(failure(error.code, error.message, error.details))
+    return json(failure('failed', error instanceof Error ? error.message : String(error)))
+  } finally {
+    inFlight.delete(key)
+  }
+}
+
+/** Permanently purge every trash entry. */
+async function handleEmpty() {
+  const busy = claim('empty', 'emptying the trash')
+  if (busy) return json(busy)
+  try {
+    return json({ ok: true, value: await emptyTrash() })
+  } catch (error) {
+    if (error instanceof SessionDeleteRefusal) return json(failure(error.code, error.message, error.details))
+    return json(failure('failed', error instanceof Error ? error.message : String(error)))
+  } finally {
+    inFlight.delete('empty')
+  }
+}
+
+/** Purge trash entries older than `maxAgeMs`. */
+async function handleExpire(args) {
+  const maxAgeMs = typeof args.maxAgeMs === 'number' ? args.maxAgeMs : Number.NaN
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs < 0) return json(failure('invalid', 'maxAgeMs must be a non-negative number'))
+  return json({ ok: true, value: await purgeExpiredTrash(maxAgeMs) })
 }
 
 /**

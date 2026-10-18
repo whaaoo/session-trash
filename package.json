@@ -1,8 +1,8 @@
 {
   "name": "dsh-session-trash",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
-  "description": "Session row actions that move a stored Session to a local trash folder or delete it permanently.",
+  "description": "Session row actions that move a stored Session to a local trash folder, restore it, or delete it permanently, with a trash manager dialog.",
   "type": "module",
   "main": "index.js",
   "exports": {
